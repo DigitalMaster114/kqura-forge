@@ -1,0 +1,5 @@
+runpod>=1.6.0
+fastapi
+uvicorn
+pillow
+trimesh
