@@ -34,6 +34,14 @@ RUN git clone --depth 1 https://github.com/Tencent/Hunyuan3D-2 /app/Hunyuan3D-2 
     ( cd hy3dgen/texgen/differentiable_renderer && python setup.py install ) && \
     python -c "import custom_rasterizer; print('texture-bake: ON')" || echo "texture-bake: OFF"
 
+# The texture (paint) pipeline imports diffusers' StableDiffusion + AutoencoderKL.
+# On torch 2.4, older/mismatched diffusers fail to import with
+# "infer_schema: Parameter q has unsupported type torch.Tensor". Pin diffusers to
+# a torch-2.4-compatible build. Verification is non-fatal so a version hiccup
+# can't hard-fail the whole image (the shape engine still ships either way).
+RUN pip install --no-cache-dir "diffusers==0.30.0" || pip install --no-cache-dir "diffusers==0.31.0" || true
+RUN python -c "from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL; print('diffusers import: OK')" || echo "WARN: diffusers still not importable — texture stage may fail"
+
 COPY handler.py /app/handler.py
 
 # RunPod serverless invokes the handler; it never listens on a port.
