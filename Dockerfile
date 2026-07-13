@@ -95,8 +95,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir bpy && \
     python -c "import bpy; print('bpy (Blender) OK:', bpy.app.version_string)"
 
-# group 5: numpy pinned LAST so nothing above (incl. bpy) floats it to 2.x
-RUN pip install --no-cache-dir "numpy==1.24.4"
+# group 5: numpy pinned LAST so nothing above (incl. bpy) floats it to 2.x.
+# 1.26.4, not the repo's 1.24.4: the paint runtime pulls pytorch_lightning ->
+# torchmetrics -> matplotlib, and modern matplotlib requires numpy>=1.25
+# ("Matplotlib requires numpy>=1.25; you have 1.24.4" was the retex failure).
+# 1.26.4 satisfies that while staying below the numpy-2.x ABI break.
+RUN pip install --no-cache-dir "numpy==1.26.4"
 
 # torchvision >= 0.17 removed transforms.functional_tensor, but basicsr (used by
 # the RealESRGAN super-resolution pass) still imports it. Write a permanent shim
