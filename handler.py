@@ -58,6 +58,23 @@ def _backend():
     return b
 
 
+def _load_pretrained(cls, repo, **kwargs):
+    """Load a HF pipeline, self-healing a corrupt/partial cache. If the first
+    load fails (e.g. "Something wrong while loading .../snapshots/..." from a
+    download that was interrupted), wipe THIS model's cache dir and re-download
+    once. This kills the class of runtime failures we can't bake around."""
+    import shutil, glob
+    try:
+        return cls.from_pretrained(repo, **kwargs)
+    except Exception as e:
+        print("model load failed, clearing cache + retrying:", str(e)[:300])
+        hf = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        safe = repo.replace("/", "--")
+        for d in glob.glob(os.path.join(hf, "hub", "models--" + safe + "*")):
+            shutil.rmtree(d, ignore_errors=True)
+        return cls.from_pretrained(repo, **kwargs)
+
+
 def _decode_image(data_url):
     m = re.match(r"^data:image/(png|jpeg|webp);base64,(.+)$", data_url or "", re.S)
     if not m:
@@ -110,14 +127,14 @@ def _run_hunyuan(out_path, op, prompt, views, tex):
     if len(clean) >= 2:
         try:
             if "shape_mv" not in _hy_pipes:
-                _hy_pipes["shape_mv"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(MV_MODEL)
+                _hy_pipes["shape_mv"] = _load_pretrained(Hunyuan3DDiTFlowMatchingPipeline, MV_MODEL)
             mesh = _hy_pipes["shape_mv"](image=clean)[0]
         except Exception as e:
             print("multiview failed, falling back to single view:", e)
             mesh = None
     if mesh is None:
         if "shape" not in _hy_pipes:
-            _hy_pipes["shape"] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(MODEL_ID)
+            _hy_pipes["shape"] = _load_pretrained(Hunyuan3DDiTFlowMatchingPipeline, MODEL_ID)
         mesh = _hy_pipes["shape"](image=front)[0]
 
     tex_img = tex if tex is not None else front
@@ -129,7 +146,7 @@ def _run_hunyuan(out_path, op, prompt, views, tex):
     try:
         from hy3dgen.texgen import Hunyuan3DPaintPipeline
         if "paint" not in _hy_pipes:
-            _hy_pipes["paint"] = Hunyuan3DPaintPipeline.from_pretrained("tencent/Hunyuan3D-2")
+            _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
         mesh = _hy_pipes["paint"](mesh, image=tex_img)
     except Exception as e:  # texture stage optional (needs more VRAM)
         print("texture stage skipped:", e)
@@ -154,7 +171,7 @@ def _run_retex(out_path, mesh_glb, tex_img, front_img):
         pass
     from hy3dgen.texgen import Hunyuan3DPaintPipeline
     if "paint" not in _hy_pipes:
-        _hy_pipes["paint"] = Hunyuan3DPaintPipeline.from_pretrained("tencent/Hunyuan3D-2")
+        _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
     mesh = _hy_pipes["paint"](mesh, image=ref)
     mesh.export(out_path)
 
