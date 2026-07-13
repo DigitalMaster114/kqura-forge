@@ -35,6 +35,9 @@ import runpod
 BACKEND = os.environ.get("KQ_FORGE_BACKEND", "auto")            # auto | mock | hunyuan3d
 MODEL_ID = os.environ.get("KQ_FORGE_MODEL", "tencent/Hunyuan3D-2")
 MV_MODEL = os.environ.get("KQ_FORGE_MODEL_MV", "tencent/Hunyuan3D-2mv")
+# texture painter: 'hunyuan3d-paint-v2-0' = full quality (default — KQURA is
+# quality-first), 'hunyuan3d-paint-v2-0-turbo' = ~2x faster but muddier.
+PAINT_SUBFOLDER = os.environ.get("KQ_FORGE_PAINT", "hunyuan3d-paint-v2-0")
 OUT_DIR = os.environ.get("KQ_FORGE_OUT", "/tmp/kqura_forge_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -165,7 +168,7 @@ def _run_hunyuan(out_path, op, prompt, views, tex):
         from hy3dgen.texgen import Hunyuan3DPaintPipeline
         if "paint" not in _hy_pipes:
             _ensure_texture_models()
-            _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
+            _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2", subfolder=PAINT_SUBFOLDER)
         mesh = _hy_pipes["paint"](mesh, image=tex_img)
     except Exception as e:  # texture stage optional (needs more VRAM)
         print("texture stage skipped:", e)
@@ -191,7 +194,7 @@ def _run_retex(out_path, mesh_glb, tex_img, front_img):
     from hy3dgen.texgen import Hunyuan3DPaintPipeline
     if "paint" not in _hy_pipes:
         _ensure_texture_models()
-        _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
+        _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2", subfolder=PAINT_SUBFOLDER)
     mesh = _hy_pipes["paint"](mesh, image=ref)
     mesh.export(out_path)
 
