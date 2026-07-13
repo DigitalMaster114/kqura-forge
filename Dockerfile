@@ -49,18 +49,30 @@ RUN set +e; while IFS= read -r pkg; do \
     done < /tmp/req.txt; \
     echo '--- skipped packages (if any) ---'; cat /tmp/pipskip.log 2>/dev/null || echo '(none)'; exit 0
 
-# --- the CRITICAL runtime set, pinned to 2.1's own requirements — LOUD.
-# The tolerant loop above may skip things; these are the packages the engine
-# demonstrably imports (verified against the repo source). If one of these
-# fails, the build fails HERE naming it.
+# --- the CRITICAL runtime set, pinned to 2.1's own requirements — LOUD, and
+# split into labeled groups so a failure names its group in the log. These are
+# the packages the engine demonstrably imports (verified against repo source).
+
+# group 1: core ML
 RUN pip install --no-cache-dir \
       "transformers==4.46.0" "diffusers==0.30.0" "accelerate==1.1.1" \
       "pytorch-lightning==1.9.5" "omegaconf==2.3.0" "einops==0.8.0" \
-      "opencv-python==4.10.0.84" "realesrgan==0.3.0" "basicsr==1.4.2" \
+      "safetensors==0.4.4" "huggingface-hub==0.30.2" timm
+
+# group 2: vision + mesh
+RUN pip install --no-cache-dir \
+      "opencv-python==4.10.0.84" "scikit-image==0.24.0" "imageio==2.36.0" \
       "rembg==2.0.65" "onnxruntime==1.16.3" pymeshlab "pygltflib==1.16.3" \
-      "xatlas==0.0.9" "open3d==0.18.0" "scikit-image==0.24.0" "imageio==2.36.0" \
-      timm "safetensors==0.4.4" "huggingface-hub==0.30.2" && \
-    pip install --no-cache-dir "numpy==1.24.4"
+      "xatlas==0.0.9" "open3d==0.18.0"
+
+# group 3: basicsr — THE notorious installer. Its setup.py imports torch, but
+# pip's isolated build sandbox can't see our torch -> install with isolation
+# OFF so it builds against the real environment. realesrgan rides on top.
+RUN pip install --no-cache-dir --no-build-isolation "basicsr==1.4.2"
+RUN pip install --no-cache-dir "realesrgan==0.3.0"
+
+# group 4: numpy pinned LAST so nothing above floats it to 2.x
+RUN pip install --no-cache-dir "numpy==1.24.4"
 
 # torchvision >= 0.17 removed transforms.functional_tensor, but basicsr (used by
 # the RealESRGAN super-resolution pass) still imports it. Write a permanent shim
