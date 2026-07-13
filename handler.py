@@ -260,6 +260,19 @@ def handler(event):
             mesh_glb = base64.b64decode(mg)
         except Exception:
             mesh_glb = None
+    # Big meshes can't ride inside the /run request (RunPod caps it ~10MB), so
+    # the studio sends a signed download URL instead — fetch the mesh from there.
+    if mesh_glb is None and (inp.get("mesh_url") or ""):
+        try:
+            import urllib.request
+            req = urllib.request.Request(inp["mesh_url"], headers={"User-Agent": "KQURA-Forge/1.0"})
+            data = urllib.request.urlopen(req, timeout=180).read()
+            if data.startswith(b"glTF"):
+                mesh_glb = data
+            else:
+                return {"error": "mesh_url did not return a GLB (got %d bytes, wrong magic)" % len(data)}
+        except Exception as e:
+            return {"error": "could not download the model to texture: " + str(e)[:300]}
 
     if op == "image3d" and "front" not in views:
         return {"error": "image3d needs at least a front image"}

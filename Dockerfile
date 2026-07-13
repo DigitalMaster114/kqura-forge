@@ -21,18 +21,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Hunyuan3D-2 (open HD model tooling) + the texture-bake compiled components.
-# Strip any torch/torchvision pins from its requirements so the base image's
-# torch 2.4 (which has torch.xpu) is kept — otherwise a downgrade to 2.2 brings
-# back "module 'torch' has no attribute 'xpu'". custom_rasterizer then compiles
-# against the final torch 2.4.
+# Hunyuan3D-2 (open HD model tooling). Strip any torch/torchvision pins from its
+# requirements so the base image's torch 2.4 (which has torch.xpu) is kept —
+# otherwise a downgrade to 2.2 brings back "module 'torch' has no attribute 'xpu'".
 RUN git clone --depth 1 https://github.com/Tencent/Hunyuan3D-2 /app/Hunyuan3D-2 && \
     cd /app/Hunyuan3D-2 && \
     sed -i '/^torch\b/d; /^torchvision\b/d; /^torchaudio\b/d' requirements.txt && \
-    pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -e . && \
-    ( cd hy3dgen/texgen/custom_rasterizer && python setup.py install ) && \
-    ( cd hy3dgen/texgen/differentiable_renderer && python setup.py install ) && \
-    python -c "import custom_rasterizer; print('texture-bake: ON')" || echo "texture-bake: OFF"
+    pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -e .
+
+# TEXTURE-BAKE compiled components. THE ROOT CAUSE of every "Something wrong
+# while loading" texture failure was this step silently failing (the paint
+# pipeline's MeshRender does `import custom_rasterizer`; Hunyuan swallows the
+# ModuleNotFoundError behind a generic message). Two rules now:
+#  1. The build machine has NO GPU, so the CUDA extension must be told which
+#     GPU architectures to compile for: TORCH_CUDA_ARCH_LIST (A40/A6000=8.6,
+#     A100=8.0, Ada=8.9) + FORCE_CUDA=1.
+#  2. If these steps fail, the BUILD fails — no more shipping images with
+#     texturing quietly broken.
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9+PTX" FORCE_CUDA=1
+RUN pip install --no-cache-dir ninja pybind11
+RUN cd /app/Hunyuan3D-2/hy3dgen/texgen/custom_rasterizer && python setup.py install
+RUN cd /app/Hunyuan3D-2/hy3dgen/texgen/differentiable_renderer && python setup.py install
+RUN python -c "import custom_rasterizer; print('KQURA texture-bake: COMPILED OK')"
 
 # The texture (paint) pipeline imports diffusers' StableDiffusion + AutoencoderKL.
 # These four packages MUST agree or the import cascades through version errors:
