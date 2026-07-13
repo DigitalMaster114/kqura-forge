@@ -11,7 +11,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     KQ_FORGE_MODEL=tencent/Hunyuan3D-2 \
     KQ_FORGE_MODEL_MV=tencent/Hunyuan3D-2mv \
     HF_HOME=/opt/hf \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
     KQ_FORGE_OUT=/tmp/kqura_forge_out
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

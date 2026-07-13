@@ -75,6 +75,24 @@ def _load_pretrained(cls, repo, **kwargs):
         return cls.from_pretrained(repo, **kwargs)
 
 
+def _hf_token():
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+
+def _ensure_texture_models():
+    """Pre-download the paint pipeline's two sub-models (delight + paint-turbo)
+    EXPLICITLY. Hunyuan's own loader swallows download errors behind a generic
+    "Something wrong while loading ..." — doing it ourselves surfaces the REAL
+    cause (usually HF rate-limiting without a token) and, with HF_TOKEN set,
+    just works. Cached, so it's a no-op once present."""
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        "tencent/Hunyuan3D-2",
+        allow_patterns=["hunyuan3d-delight-v2-0/*", "hunyuan3d-paint-v2-0/*", "hunyuan3d-paint-v2-0-turbo/*"],
+        token=_hf_token(), max_workers=4,
+    )
+
+
 def _decode_image(data_url):
     m = re.match(r"^data:image/(png|jpeg|webp);base64,(.+)$", data_url or "", re.S)
     if not m:
@@ -146,6 +164,7 @@ def _run_hunyuan(out_path, op, prompt, views, tex):
     try:
         from hy3dgen.texgen import Hunyuan3DPaintPipeline
         if "paint" not in _hy_pipes:
+            _ensure_texture_models()
             _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
         mesh = _hy_pipes["paint"](mesh, image=tex_img)
     except Exception as e:  # texture stage optional (needs more VRAM)
@@ -171,6 +190,7 @@ def _run_retex(out_path, mesh_glb, tex_img, front_img):
         pass
     from hy3dgen.texgen import Hunyuan3DPaintPipeline
     if "paint" not in _hy_pipes:
+        _ensure_texture_models()
         _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2")
     mesh = _hy_pipes["paint"](mesh, image=ref)
     mesh.export(out_path)
@@ -260,7 +280,11 @@ def handler(event):
         else:
             _run_mock(out_path, op, prompt, views, tex)
     except Exception as e:
-        return {"error": str(e)[:500]}
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)   # full trace in the RunPod logs
+        # surface the real cause (last frames) instead of a swallowed generic message
+        return {"error": (str(e) or "generation failed")[:300] + "  ||  " + tb[-700:]}
 
     if not os.path.isfile(out_path) or os.path.getsize(out_path) < 40:
         return {"error": "generation produced no model file"}
