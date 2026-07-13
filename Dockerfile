@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     KQ_FORGE_BACKEND=auto \
     KQ_FORGE_MODEL=tencent/Hunyuan3D-2 \
     KQ_FORGE_MODEL_MV=tencent/Hunyuan3D-2mv \
-    HF_HOME=/runpod-volume/hf \
+    HF_HOME=/opt/hf \
     KQ_FORGE_OUT=/tmp/kqura_forge_out
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,6 +51,18 @@ RUN pip install --no-cache-dir \
       "peft==0.12.0"
 RUN python -c "from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix2pix import StableDiffusionInstructPix2PixPipeline; from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL; print('KQURA texture stack import: OK')" \
     || echo "WARN: texture stack still not importable — check the pinned versions"
+
+# Bake the Hunyuan3D-2 model (shape + texture/paint) INTO the image so the worker
+# never downloads it at runtime. This eliminates the whole class of runtime
+# failures we hit: "not enough disk space", partial/corrupt snapshots, and
+# "Something wrong while loading .../snapshots/...". The model ships complete and
+# verified inside the image (HF_HOME=/opt/hf). Retries a couple of times so a
+# flaky build-time download can't ship a half-baked model.
+RUN for i in 1 2 3; do \
+      python -c "from huggingface_hub import snapshot_download; snapshot_download('tencent/Hunyuan3D-2', ignore_patterns=['*.md','*.txt'], max_workers=8)" \
+      && echo 'KQURA: Hunyuan3D-2 baked into image' && break || { echo 'download failed, retrying'; sleep 10; }; \
+    done; \
+    python -c "import os; p='/opt/hf/hub'; assert os.path.isdir(p) and any('Hunyuan3D-2' in d for d in os.listdir(p)), 'model not baked'; print('KQURA: model cache verified')"
 
 COPY handler.py /app/handler.py
 
