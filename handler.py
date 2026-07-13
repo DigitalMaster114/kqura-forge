@@ -1,49 +1,57 @@
 """
-KQURA Neural Forge - RunPod SERVERLESS handler
-==============================================
-Same neural engine as the self-hosted worker (Tencent Hunyuan3D-2, open
-weights - no third-party 3D services), packaged as a RunPod *serverless*
-endpoint so it costs $0 when idle and cold-starts itself the instant the
-studio sends a job. No always-on pod, no tunnel, no terminal.
+KQURA Neural Forge - RunPod SERVERLESS handler  (ENGINE v2: Hunyuan3D-2.1)
+==========================================================================
+The quality-leap engine: Tencent Hunyuan3D-2.1 (open weights, KQURA-owned).
+vs the 2.0 engine this adds:
+  - hunyuan3d-paintpbr-v2-1: PHYSICALLY-BASED texture painting (albedo +
+    metallic/roughness) with built-in RealESRGAN 4x SUPER-RESOLUTION —
+    the polished-skin look.
+  - hunyuan3d-dit-v2-1: newer shape model.
 
-Flow:
-  studio  --POST /run { input:{op, prompt, image, views, texture_image,
-                                mesh_glb, ingest_url, ingest_key,
-                                ingest_token} }-->  this handler
-  handler --sculpt/retex--> finished GLB
-  handler --POST ingest_url (multipart glb + key + token)--> studio asset store
-  handler --return { key: ingest_key }--> RunPod --> studio /status COMPLETED
+Contract with the studio is UNCHANGED (op/prompt/image/views/texture_image/
+mesh_glb/mesh_url + ingest_url/key/token; returns {key} on success, {error}
+with traceback tail on failure). Rollback = the *_hy20_backup files.
 
-The studio already knows the destination asset key up front, so the moment
-RunPod reports COMPLETED the file is already sitting in our store. The GLB
-never travels back through RunPod's result JSON (no size limit, no S3).
-
-Env (set on the RunPod endpoint, optional):
-  KQ_FORGE_BACKEND   auto | mock | hunyuan3d   (default auto)
-  KQ_FORGE_MODEL     tencent/Hunyuan3D-2       (single-view shape model)
-  KQ_FORGE_MODEL_MV  tencent/Hunyuan3D-2mv     (multi-view shape model)
+Env (all optional):
+  KQ_FORGE_BACKEND      auto | mock | hy21          (default auto)
+  KQ_FORGE_MODEL        tencent/Hunyuan3D-2.1
+  KQ_FORGE_PAINT_VIEWS  multiview count for the painter (default 6)
+  KQ_FORGE_PAINT_RES    painter view resolution (default 512; 768 = slower/finer)
 """
 import base64
 import io
 import os
 import re
+import sys
 import time
 import uuid
 
 import runpod
 
-BACKEND = os.environ.get("KQ_FORGE_BACKEND", "auto")            # auto | mock | hunyuan3d
-MODEL_ID = os.environ.get("KQ_FORGE_MODEL", "tencent/Hunyuan3D-2")
-MV_MODEL = os.environ.get("KQ_FORGE_MODEL_MV", "tencent/Hunyuan3D-2mv")
-# texture painter: 'hunyuan3d-paint-v2-0' = full quality (default — KQURA is
-# quality-first), 'hunyuan3d-paint-v2-0-turbo' = ~2x faster but muddier.
-PAINT_SUBFOLDER = os.environ.get("KQ_FORGE_PAINT", "hunyuan3d-paint-v2-0")
+REPO = "/app/Hunyuan3D-2.1"
+# 2.1 ships hy3dshape/ and hy3dpaint/ as separate source trees + expects to run
+# from the repo root (its configs/ckpt paths are relative).
+for _p in (REPO, os.path.join(REPO, "hy3dshape"), os.path.join(REPO, "hy3dpaint")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    os.chdir(REPO)
+except Exception:
+    pass
+try:  # 2.1's compatibility shim for newer torchvision
+    from torchvision_fix import apply_fix
+    apply_fix()
+except Exception as _e:
+    print("torchvision_fix skipped:", _e)
+
+BACKEND = os.environ.get("KQ_FORGE_BACKEND", "auto")          # auto | mock | hy21
+MODEL_ID = os.environ.get("KQ_FORGE_MODEL", "tencent/Hunyuan3D-2.1")
+PAINT_VIEWS = int(os.environ.get("KQ_FORGE_PAINT_VIEWS", "6"))
+PAINT_RES = int(os.environ.get("KQ_FORGE_PAINT_RES", "512"))
 OUT_DIR = os.environ.get("KQ_FORGE_OUT", "/tmp/kqura_forge_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# pipelines are cached across warm invocations so only the first (cold) job
-# pays the model-load cost.
-_hy_pipes = {}
+_pipes = {}          # cached across warm invocations
 _backend_cached = [None]
 
 
@@ -53,19 +61,18 @@ def _backend():
     b = BACKEND
     if b == "auto":
         try:
-            import hy3dgen  # noqa: F401
-            b = "hunyuan3d"
-        except Exception:
+            import hy3dshape  # noqa: F401
+            b = "hy21"
+        except Exception as e:
+            print("hy3dshape import failed -> mock:", e)
             b = "mock"
     _backend_cached[0] = b
     return b
 
 
 def _load_pretrained(cls, repo, **kwargs):
-    """Load a HF pipeline, self-healing a corrupt/partial cache. If the first
-    load fails (e.g. "Something wrong while loading .../snapshots/..." from a
-    download that was interrupted), wipe THIS model's cache dir and re-download
-    once. This kills the class of runtime failures we can't bake around."""
+    """Self-heal a corrupt/partial HF cache: on load failure wipe THIS model's
+    cache dir and re-download once."""
     import shutil, glob
     try:
         return cls.from_pretrained(repo, **kwargs)
@@ -78,22 +85,22 @@ def _load_pretrained(cls, repo, **kwargs):
         return cls.from_pretrained(repo, **kwargs)
 
 
-def _hf_token():
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+def _shape_pipe():
+    if "shape" not in _pipes:
+        from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+        _pipes["shape"] = _load_pretrained(Hunyuan3DDiTFlowMatchingPipeline, MODEL_ID)
+    return _pipes["shape"]
 
 
-def _ensure_texture_models():
-    """Pre-download the paint pipeline's two sub-models (delight + paint-turbo)
-    EXPLICITLY. Hunyuan's own loader swallows download errors behind a generic
-    "Something wrong while loading ..." — doing it ourselves surfaces the REAL
-    cause (usually HF rate-limiting without a token) and, with HF_TOKEN set,
-    just works. Cached, so it's a no-op once present."""
-    from huggingface_hub import snapshot_download
-    snapshot_download(
-        "tencent/Hunyuan3D-2",
-        allow_patterns=["hunyuan3d-delight-v2-0/*", "hunyuan3d-paint-v2-0/*", "hunyuan3d-paint-v2-0-turbo/*"],
-        token=_hf_token(), max_workers=4,
-    )
+def _paint_pipe():
+    if "paint" not in _pipes:
+        from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+        conf = Hunyuan3DPaintConfig(PAINT_VIEWS, PAINT_RES)
+        conf.realesrgan_ckpt_path = os.path.join(REPO, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth")
+        conf.multiview_cfg_path = os.path.join(REPO, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml")
+        conf.custom_pipeline = os.path.join(REPO, "hy3dpaint", "hunyuanpaintpbr")
+        _pipes["paint"] = Hunyuan3DPaintPipeline(conf)
+    return _pipes["paint"]
 
 
 def _decode_image(data_url):
@@ -107,9 +114,29 @@ def _decode_image(data_url):
     return bg.convert("RGB")
 
 
+def _paint_mesh(mesh_path, ref_pil, out_path):
+    """Run the 2.1 PBR painter (file-path API) and guarantee a GLB comes out."""
+    ref_path = out_path + ".ref.png"
+    ref_pil.save(ref_path)
+    pipe = _paint_pipe()
+    try:
+        res = pipe(mesh_path=mesh_path, image_path=ref_path, output_mesh_path=out_path)
+    except TypeError:
+        res = pipe(mesh_path, ref_path, out_path)   # older positional signature
+    p = res if isinstance(res, str) and os.path.isfile(res) else out_path
+    if not os.path.isfile(p):
+        raise RuntimeError("painter finished but produced no file")
+    with open(p, "rb") as f:
+        head = f.read(4)
+    if head != b"glTF":   # painter wrote a non-glb container -> repackage
+        import trimesh
+        m = trimesh.load(p)
+        m.export(out_path)
+        p = out_path
+    return p
+
+
 def _run_mock(out_path, op, prompt, views, tex):
-    """No-GPU placeholder GLB so the whole studio->serverless->studio loop
-    can be verified before the model weights are installed."""
     import trimesh
     body = trimesh.creation.capsule(radius=0.25, height=0.9)
     body.apply_translation([0, 0.7, 0])
@@ -121,86 +148,73 @@ def _run_mock(out_path, op, prompt, views, tex):
 def _run_mock_retex(out_path, mesh_glb):
     if mesh_glb:
         with open(out_path, "wb") as f:
-            f.write(mesh_glb)   # echo the mesh back so the studio flow completes
+            f.write(mesh_glb)
     else:
         _run_mock(out_path, "retex", "", {}, None)
 
 
-def _run_hunyuan(out_path, op, prompt, views, tex):
-    """Hunyuan3D-2: image(s) -> shape -> texture -> GLB.
-    views: {front/back/left/right: PIL} (front required). Multi-view uses the
-    back/side references so the model stops inventing hidden geometry."""
+def _run_hy21(out_path, op, prompt, views, tex):
+    """Hunyuan3D-2.1: front image -> shape -> PBR texture (+4x SR) -> GLB.
+    (2.1 has no multiview shape model yet; extra views are accepted but only
+    the front drives the sculpt — the texture ref drives the colors.)"""
     if not views or "front" not in views:
-        raise RuntimeError("This backend sculpts from an image; give it at least a front view.")
-    from hy3dgen.rembg import BackgroundRemover
-    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-
+        raise RuntimeError("This engine sculpts from an image; give it at least a front view.")
+    from hy3dshape.rembg import BackgroundRemover
     rem = BackgroundRemover()
-    clean = {}
-    for k, im in views.items():
-        try:
-            clean[k] = rem(im)
-        except Exception:
-            clean[k] = im
-    front = clean["front"]
+    front = views["front"]
+    try:
+        front = rem(front)
+    except Exception:
+        pass
 
-    mesh = None
-    if len(clean) >= 2:
-        try:
-            if "shape_mv" not in _hy_pipes:
-                _hy_pipes["shape_mv"] = _load_pretrained(Hunyuan3DDiTFlowMatchingPipeline, MV_MODEL)
-            mesh = _hy_pipes["shape_mv"](image=clean)[0]
-        except Exception as e:
-            print("multiview failed, falling back to single view:", e)
-            mesh = None
-    if mesh is None:
-        if "shape" not in _hy_pipes:
-            _hy_pipes["shape"] = _load_pretrained(Hunyuan3DDiTFlowMatchingPipeline, MODEL_ID)
-        mesh = _hy_pipes["shape"](image=front)[0]
+    mesh = _shape_pipe()(image=front)[0]
+    raw_path = out_path + ".raw.glb"
+    mesh.export(raw_path)
 
-    tex_img = tex if tex is not None else front
+    ref = tex if tex is not None else views["front"]
     if tex is not None:
         try:
-            tex_img = rem(tex)
+            ref = rem(tex)
         except Exception:
-            tex_img = tex
+            ref = tex
     try:
-        from hy3dgen.texgen import Hunyuan3DPaintPipeline
-        if "paint" not in _hy_pipes:
-            _ensure_texture_models()
-            _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2", subfolder=PAINT_SUBFOLDER)
-        mesh = _hy_pipes["paint"](mesh, image=tex_img)
-    except Exception as e:  # texture stage optional (needs more VRAM)
-        print("texture stage skipped:", e)
+        _paint_mesh(raw_path, ref, out_path)
+    except Exception as e:
+        import traceback
+        print("PBR texture stage failed, delivering shape-only:", traceback.format_exc()[-800:])
+        import shutil
+        shutil.copyfile(raw_path, out_path)
+    finally:
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
 
-    mesh.export(out_path)
 
-
-def _run_retex(out_path, mesh_glb, tex_img, front_img):
-    """Re-texture an EXISTING mesh (GLB bytes) from a reference image."""
-    import trimesh
+def _run_retex21(out_path, mesh_glb, tex_img, front_img):
+    ref = tex_img if tex_img is not None else front_img
     if not mesh_glb:
         raise RuntimeError("retex needs the model GLB")
-    ref = tex_img if tex_img is not None else front_img
     if ref is None:
         raise RuntimeError("retex needs a reference image")
-    scene = trimesh.load(io.BytesIO(mesh_glb), file_type="glb")
-    mesh = scene.dump(concatenate=True) if hasattr(scene, "dump") else scene
     try:
-        from hy3dgen.rembg import BackgroundRemover
+        from hy3dshape.rembg import BackgroundRemover
         ref = BackgroundRemover()(ref)
     except Exception:
         pass
-    from hy3dgen.texgen import Hunyuan3DPaintPipeline
-    if "paint" not in _hy_pipes:
-        _ensure_texture_models()
-        _hy_pipes["paint"] = _load_pretrained(Hunyuan3DPaintPipeline, "tencent/Hunyuan3D-2", subfolder=PAINT_SUBFOLDER)
-    mesh = _hy_pipes["paint"](mesh, image=ref)
-    mesh.export(out_path)
+    raw_path = out_path + ".raw.glb"
+    with open(raw_path, "wb") as f:
+        f.write(mesh_glb)
+    try:
+        _paint_mesh(raw_path, ref, out_path)
+    finally:
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
 
 
 def _ingest(ingest_url, key, token, glb_path):
-    """POST the finished GLB back to the studio's asset store (HMAC authed)."""
     import urllib.request
     with open(glb_path, "rb") as f:
         glb = f.read()
@@ -263,12 +277,11 @@ def handler(event):
             mesh_glb = base64.b64decode(mg)
         except Exception:
             mesh_glb = None
-    # Big meshes can't ride inside the /run request (RunPod caps it ~10MB), so
-    # the studio sends a signed download URL instead — fetch the mesh from there.
+    # big meshes ride as a signed download URL (RunPod caps /run at ~10MB)
     if mesh_glb is None and (inp.get("mesh_url") or ""):
         try:
             import urllib.request
-            req = urllib.request.Request(inp["mesh_url"], headers={"User-Agent": "KQURA-Forge/1.0"})
+            req = urllib.request.Request(inp["mesh_url"], headers={"User-Agent": "KQURA-Forge/2.1"})
             data = urllib.request.urlopen(req, timeout=180).read()
             if data.startswith(b"glTF"):
                 mesh_glb = data
@@ -287,19 +300,18 @@ def handler(event):
     try:
         if op == "retex":
             front = views.get("front")
-            if _backend() == "hunyuan3d":
-                _run_retex(out_path, mesh_glb, tex, front)
+            if _backend() == "hy21":
+                _run_retex21(out_path, mesh_glb, tex, front)
             else:
                 _run_mock_retex(out_path, mesh_glb)
-        elif _backend() == "hunyuan3d":
-            _run_hunyuan(out_path, op, prompt, views, tex)
+        elif _backend() == "hy21":
+            _run_hy21(out_path, op, prompt, views, tex)
         else:
             _run_mock(out_path, op, prompt, views, tex)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(tb)   # full trace in the RunPod logs
-        # surface the real cause (last frames) instead of a swallowed generic message
+        print(tb)
         return {"error": (str(e) or "generation failed")[:300] + "  ||  " + tb[-700:]}
 
     if not os.path.isfile(out_path) or os.path.getsize(out_path) < 40:
@@ -315,7 +327,7 @@ def handler(event):
         except OSError:
             pass
 
-    return {"key": ingest_key, "backend": _backend(),
+    return {"key": ingest_key, "backend": _backend(), "engine": "hunyuan3d-2.1-pbr",
             "seconds": round(time.time() - t0, 1), "ingest": ingest_resp[:200]}
 
 
