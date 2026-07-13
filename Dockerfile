@@ -42,7 +42,9 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9+PTX" FORCE_CUDA=1
 RUN pip install --no-cache-dir ninja pybind11
 RUN cd /app/Hunyuan3D-2/hy3dgen/texgen/custom_rasterizer && python setup.py install
 RUN cd /app/Hunyuan3D-2/hy3dgen/texgen/differentiable_renderer && python setup.py install
-RUN python -c "import custom_rasterizer; print('KQURA texture-bake: COMPILED OK')"
+# NOTE: torch must be imported first — the compiled extension links against
+# torch's shared libraries (libc10.so), which only load with torch itself.
+RUN python -c "import torch, custom_rasterizer; print('KQURA texture-bake: COMPILED OK')"
 
 # The texture (paint) pipeline imports diffusers' StableDiffusion + AutoencoderKL.
 # These four packages MUST agree or the import cascades through version errors:
