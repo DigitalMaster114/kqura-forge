@@ -83,7 +83,19 @@ RUN set +e; \
     pip install --no-cache-dir "realesrgan==0.3.0" || pip install --no-cache-dir --no-build-isolation "realesrgan==0.3.0" || echo "!! MISSING: realesrgan" >> /tmp/pipskip.log; \
     exit 0
 
-# group 4: numpy pinned LAST so nothing above floats it to 2.x
+# group 4: bpy (Blender-as-a-module) — the paint engine's GLB packer imports it
+# (DifferentiableRenderer/mesh_utils.py: `import bpy`). The repo pins bpy==4.0
+# which has no wheel for this python; modern bpy (4.1+) does. Blender needs a
+# handful of X/GL system libs even headless. LOUD — this was the gate's only
+# fatal, so it must work.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+      libsm6 libice6 libegl1 libxrandr2 libxinerama1 libxcursor1 libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir bpy && \
+    python -c "import bpy; print('bpy (Blender) OK:', bpy.app.version_string)"
+
+# group 5: numpy pinned LAST so nothing above (incl. bpy) floats it to 2.x
 RUN pip install --no-cache-dir "numpy==1.24.4"
 
 # torchvision >= 0.17 removed transforms.functional_tensor, but basicsr (used by

@@ -45,6 +45,7 @@ check("basicsr", lambda: __import__("basicsr"), diag)
 check("realesrgan", lambda: __import__("realesrgan"), diag)
 check("rembg", lambda: __import__("rembg"), diag)
 check("custom_rasterizer (compiled)", lambda: __import__("custom_rasterizer"), diag)
+check("bpy (Blender — GLB packer)", lambda: __import__("bpy"), diag)
 
 try:
     from torchvision_fix import apply_fix
