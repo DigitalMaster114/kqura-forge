@@ -35,12 +35,22 @@ RUN git clone --depth 1 https://github.com/Tencent/Hunyuan3D-2 /app/Hunyuan3D-2 
     python -c "import custom_rasterizer; print('texture-bake: ON')" || echo "texture-bake: OFF"
 
 # The texture (paint) pipeline imports diffusers' StableDiffusion + AutoencoderKL.
-# On torch 2.4, older/mismatched diffusers fail to import with
-# "infer_schema: Parameter q has unsupported type torch.Tensor". Pin diffusers to
-# a torch-2.4-compatible build. Verification is non-fatal so a version hiccup
-# can't hard-fail the whole image (the shape engine still ships either way).
-RUN pip install --no-cache-dir "diffusers==0.30.0" || pip install --no-cache-dir "diffusers==0.31.0" || true
-RUN python -c "from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL; print('diffusers import: OK')" || echo "WARN: diffusers still not importable — texture stage may fail"
+# These four packages MUST agree or the import cascades through version errors:
+#   torch.xpu missing            -> need torch >= 2.4 (base image has it)
+#   infer_schema: param q ...    -> diffusers too new/old for torch
+#   FLAX_WEIGHTS_NAME missing    -> transformers too new for diffusers 0.30
+# This is a single coherent, known-good snapshot (Hunyuan3D-2's mid-2024 target)
+# pinned together so nothing floats to an incompatible latest. Installed LAST so
+# it wins over whatever Hunyuan's requirements pulled.
+RUN pip install --no-cache-dir \
+      "diffusers==0.30.0" \
+      "transformers==4.44.2" \
+      "huggingface_hub==0.24.6" \
+      "accelerate==0.33.0" \
+      "tokenizers>=0.19,<0.20" \
+      "peft==0.12.0"
+RUN python -c "from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix2pix import StableDiffusionInstructPix2PixPipeline; from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL; print('KQURA texture stack import: OK')" \
+    || echo "WARN: texture stack still not importable — check the pinned versions"
 
 COPY handler.py /app/handler.py
 
