@@ -114,8 +114,42 @@ def _decode_image(data_url):
     return bg.convert("RGB")
 
 
+def _strip_base_plate(mesh):
+    """Image-to-3D models sometimes hallucinate a thin display plate under the
+    feet. Remove disconnected bottom components that are wide + flat, keeping
+    everything else. Conservative: never removes a big chunk of the model."""
+    try:
+        import trimesh
+        parts = mesh.split(only_watertight=False)
+        if len(parts) <= 1:
+            return mesh
+        b = mesh.bounds
+        h = float(b[1][1] - b[0][1]) or 1.0
+        w = float(max(b[1][0] - b[0][0], b[1][2] - b[0][2])) or 1.0
+        total_faces = sum(int(p.faces.shape[0]) for p in parts)
+        keep, removed = [], 0
+        for p in parts:
+            pb = p.bounds
+            flat = (pb[1][1] - pb[0][1]) < 0.06 * h            # very thin vertically
+            wide = max(pb[1][0] - pb[0][0], pb[1][2] - pb[0][2]) > 0.45 * w
+            at_bottom = pb[0][1] <= b[0][1] + 0.03 * h
+            small = p.faces.shape[0] < 0.30 * total_faces      # never nuke the body
+            if flat and wide and at_bottom and small:
+                removed += 1
+                continue
+            keep.append(p)
+        if removed and keep:
+            print("base plate stripped (%d component(s) removed)" % removed)
+            return trimesh.util.concatenate(keep)
+    except Exception as e:
+        print("plate strip skipped:", e)
+    return mesh
+
+
 def _paint_mesh(mesh_path, ref_pil, out_path):
-    """Run the 2.1 PBR painter (file-path API) and guarantee a GLB comes out."""
+    """Run the 2.1 PBR painter (file-path API) and guarantee a GLB comes out.
+    If the remesh prep dies (usually missing open3d for trimesh's simplifier),
+    retry once without remesh rather than failing the whole job."""
     ref_path = out_path + ".ref.png"
     ref_pil.save(ref_path)
     pipe = _paint_pipe()
@@ -123,6 +157,13 @@ def _paint_mesh(mesh_path, ref_pil, out_path):
         res = pipe(mesh_path=mesh_path, image_path=ref_path, output_mesh_path=out_path)
     except TypeError:
         res = pipe(mesh_path, ref_path, out_path)   # older positional signature
+    except Exception as e:
+        msg = str(e)
+        if "open3d" in msg or "simplify" in msg or "remesh" in msg or "decimation" in msg:
+            print("remesh prep failed (%s) -> retrying with use_remesh=False" % msg[:120])
+            res = pipe(mesh_path=mesh_path, image_path=ref_path, output_mesh_path=out_path, use_remesh=False)
+        else:
+            raise
     p = res if isinstance(res, str) and os.path.isfile(res) else out_path
     if not os.path.isfile(p):
         raise RuntimeError("painter finished but produced no file")
@@ -168,6 +209,7 @@ def _run_hy21(out_path, op, prompt, views, tex):
         pass
 
     mesh = _shape_pipe()(image=front)[0]
+    mesh = _strip_base_plate(mesh)
     raw_path = out_path + ".raw.glb"
     mesh.export(raw_path)
 

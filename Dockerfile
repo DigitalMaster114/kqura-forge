@@ -95,6 +95,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir bpy && \
     python -c "import bpy; print('bpy (Blender) OK:', bpy.app.version_string)"
 
+# group 4.5: open3d — trimesh's quadric simplifier (the painter's remesh prep)
+# imports it AT RUNTIME ("No module named 'open3d'" killed retex). Try the pinned
+# wheel, then latest, then the CPU-only build; the handler also has a
+# use_remesh=False fallback if all three fail.
+RUN pip install --no-cache-dir "open3d==0.18.0" \
+ || pip install --no-cache-dir open3d \
+ || pip install --no-cache-dir open3d-cpu \
+ || (echo '!! MISSING: open3d (painter will use the no-remesh fallback)' >> /tmp/pipskip.log)
+
 # group 5: numpy pinned LAST so nothing above (incl. bpy) floats it to 2.x.
 # 1.26.4, not the repo's 1.24.4: the paint runtime pulls pytorch_lightning ->
 # torchmetrics -> matplotlib, and modern matplotlib requires numpy>=1.25
