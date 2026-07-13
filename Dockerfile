@@ -54,10 +54,14 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9+PTX" FORCE_CUDA=1
 RUN pip install --no-cache-dir ninja pybind11
 RUN cd /app/Hunyuan3D-2.1/hy3dpaint/custom_rasterizer && \
     ( python setup.py install || pip install --no-cache-dir . )
+# Their compile_mesh_painter.sh names the output via `python3-config`, which is
+# NOT on this image's PATH -> empty suffix -> module unimportable (that was the
+# exit-2 failure). Compute the suffix with python itself instead — always present.
 RUN cd /app/Hunyuan3D-2.1/hy3dpaint/DifferentiableRenderer && \
-    ( bash compile_mesh_painter.sh || \
-      c++ -O3 -Wall -shared -std=c++11 -fPIC $(python -m pybind11 --includes) mesh_inpaint_processor.cpp -o mesh_inpaint_processor$(python3-config --extension-suffix) ) && \
-    ls mesh_inpaint_processor*.so
+    SUF="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or ".so")')" && \
+    echo "extension suffix: ${SUF}" && \
+    c++ -O3 -Wall -shared -std=c++11 -fPIC $(python -m pybind11 --includes) mesh_inpaint_processor.cpp -o "mesh_inpaint_processor${SUF}" && \
+    ls -la mesh_inpaint_processor*
 
 # --- THE GATE: the modules the worker actually uses must import, or fail loud ---
 COPY enginecheck.py /app/enginecheck.py
