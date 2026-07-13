@@ -59,17 +59,29 @@ RUN pip install --no-cache-dir \
       "pytorch-lightning==1.9.5" "omegaconf==2.3.0" "einops==0.8.0" \
       "safetensors==0.4.4" "huggingface-hub==0.30.2" timm
 
-# group 2: vision + mesh
-RUN pip install --no-cache-dir \
-      "opencv-python==4.10.0.84" "scikit-image==0.24.0" "imageio==2.36.0" \
-      "rembg==2.0.65" "onnxruntime==1.16.3" pymeshlab "pygltflib==1.16.3" \
-      "xatlas==0.0.9" "open3d==0.18.0"
+# group 2: vision + mesh — per-package with fallback (exact pin -> latest ->
+# logged as missing). The GATE below is the decisive judge and prints its
+# verdict at the END of the log, naming anything that actually matters.
+RUN set +e; \
+    t(){ pip install --no-cache-dir "$1" || pip install --no-cache-dir "$2" || echo "!! MISSING: $2" >> /tmp/pipskip.log; }; \
+    t "opencv-python==4.10.0.84" opencv-python; \
+    t "scikit-image==0.24.0" scikit-image; \
+    t "imageio==2.36.0" imageio; \
+    t "onnxruntime==1.16.3" onnxruntime; \
+    t "rembg==2.0.65" rembg; \
+    t pymeshlab pymeshlab; \
+    t "pygltflib==1.16.3" pygltflib; \
+    t "xatlas==0.0.9" xatlas; \
+    t "open3d==0.18.0" open3d; \
+    echo '--- group2 skip log ---'; cat /tmp/pipskip.log 2>/dev/null || echo '(none)'; exit 0
 
 # group 3: basicsr — THE notorious installer. Its setup.py imports torch, but
 # pip's isolated build sandbox can't see our torch -> install with isolation
 # OFF so it builds against the real environment. realesrgan rides on top.
-RUN pip install --no-cache-dir --no-build-isolation "basicsr==1.4.2"
-RUN pip install --no-cache-dir "realesrgan==0.3.0"
+RUN set +e; \
+    pip install --no-cache-dir --no-build-isolation "basicsr==1.4.2" || echo "!! MISSING: basicsr" >> /tmp/pipskip.log; \
+    pip install --no-cache-dir "realesrgan==0.3.0" || pip install --no-cache-dir --no-build-isolation "realesrgan==0.3.0" || echo "!! MISSING: realesrgan" >> /tmp/pipskip.log; \
+    exit 0
 
 # group 4: numpy pinned LAST so nothing above floats it to 2.x
 RUN pip install --no-cache-dir "numpy==1.24.4"
