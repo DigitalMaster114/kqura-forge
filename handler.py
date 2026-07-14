@@ -369,6 +369,16 @@ def _run_autorig(out_path, mesh_glb, joints):
         f.write(mesh_glb)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.gltf(filepath=raw)
+
+    # STRIP any rig the incoming model already carried. If the studio sent an
+    # already-rigged version (e.g. a prior KQURA/Blender rig), its armature +
+    # vertex groups would survive the import and collide with the fresh skeleton
+    # we build below — the glTF exporter would then emit a DOUBLED skin (two
+    # armatures fighting over the same verts) and the mesh explodes on any pose.
+    # Reduce to a clean, naked mesh first so ARMATURE_AUTO binds exactly our bones.
+    for o in list(bpy.data.objects):
+        if o.type == "ARMATURE":
+            bpy.data.objects.remove(o, do_unlink=True)
     meshes = [o for o in bpy.data.objects if o.type == "MESH"]
     if not meshes:
         raise RuntimeError("no meshes found in the model")
@@ -379,6 +389,21 @@ def _run_autorig(out_path, mesh_glb, joints):
     if len(meshes) > 1:
         bpy.ops.object.join()
     mesh = bpy.context.view_layer.objects.active
+    # drop leftover armature modifiers, old vertex groups, and any parenting so
+    # the fresh bone-heat solve starts from a blank slate (this is what keeps the
+    # exported skin at exactly our joint count instead of old+new merged)
+    for mod in list(mesh.modifiers):
+        if mod.type == "ARMATURE":
+            mesh.modifiers.remove(mod)
+    try:
+        mesh.vertex_groups.clear()
+    except Exception:
+        for vg in list(mesh.vertex_groups):
+            mesh.vertex_groups.remove(vg)
+    try:
+        mesh.parent = None
+    except Exception:
+        pass
 
     # three.js is Y-up; Blender is Z-up (the glTF importer converts the mesh the
     # same way): (x, y, z) -> (x, -z, y)
