@@ -99,10 +99,16 @@ RUN pip install --no-cache-dir bpy && \
 # imports it AT RUNTIME ("No module named 'open3d'" killed retex). Try the pinned
 # wheel, then latest, then the CPU-only build; the handler also has a
 # use_remesh=False fallback if all three fail.
-RUN pip install --no-cache-dir "open3d==0.18.0" \
- || pip install --no-cache-dir open3d \
- || pip install --no-cache-dir open3d-cpu \
- || (echo '!! MISSING: open3d (painter will use the no-remesh fallback)' >> /tmp/pipskip.log)
+# v2: each attempt PRINTS pip's actual error tail so the failure reason finally
+# lands in the build log (previous attempts failed silently in a cached layer).
+RUN set +e; \
+    for pkg in "open3d==0.18.0" "open3d==0.19.0" open3d open3d-cpu; do \
+      echo "--- trying $pkg ---"; \
+      pip install --no-cache-dir "$pkg" 2>&1 | tail -4; \
+      python -c "import open3d" 2>/dev/null && { echo "open3d INSTALLED via $pkg"; break; }; \
+    done; \
+    python -c "import open3d; print('open3d: OK')" || echo '!! MISSING: open3d (painter will use the no-remesh fallback)' >> /tmp/pipskip.log; \
+    exit 0
 
 # group 5: numpy pinned LAST so nothing above (incl. bpy) floats it to 2.x.
 # 1.26.4, not the repo's 1.24.4: the paint runtime pulls pytorch_lightning ->
@@ -133,10 +139,6 @@ RUN cd /app/Hunyuan3D-2.1/hy3dpaint/DifferentiableRenderer && \
     c++ -O3 -Wall -shared -std=c++11 -fPIC $(python -m pybind11 --includes) mesh_inpaint_processor.cpp -o "mesh_inpaint_processor${SUF}" && \
     ls -la mesh_inpaint_processor*
 
-# --- THE GATE: the modules the worker actually uses must import, or fail loud ---
-COPY enginecheck.py /app/enginecheck.py
-RUN python /app/enginecheck.py
-
 # RealESRGAN 4x super-resolution checkpoint (the painter's polish pass)
 RUN mkdir -p /app/Hunyuan3D-2.1/hy3dpaint/ckpt && \
     curl -fsSL -o /app/Hunyuan3D-2.1/hy3dpaint/ckpt/RealESRGAN_x4plus.pth \
@@ -145,16 +147,20 @@ RUN mkdir -p /app/Hunyuan3D-2.1/hy3dpaint/ckpt && \
 
 # --- Hunyuan3D-2.0 family (hy3dgen) — ONLY for the true MULTI-VIEW shape model
 # (tencent/Hunyuan3D-2mv, subfolder hunyuan3d-dit-v2-mv): back/side references
-# actually drive hidden geometry. Module names don't collide with 2.1
-# (hy3dgen vs hy3dshape/hy3dpaint). Tolerant: if this fails, the engine still
-# ships with single-view sculpt + the gate's diagnostic names it.
+# actually drive hidden geometry. Module names don't collide with 2.1.
+# --no-deps is CRITICAL: its setup.py demands transformers>=4.48 and would drag
+# numpy->2.x, transformers->5.x, gradio etc over our pinned stack (it DID, in
+# build a797195d — caught in the log). Runtime deps are already installed.
 RUN set +e; \
     git clone --depth 1 https://github.com/Tencent/Hunyuan3D-2 /app/Hunyuan3D-2 && \
     cd /app/Hunyuan3D-2 && \
-    sed -i '/^torch\b/d; /^torch=/d; /^torch>/d; /^torchvision/d; /^torchaudio/d' requirements.txt && \
-    pip install --no-cache-dir -e . ; \
+    pip install --no-cache-dir --no-deps -e . ; \
     python -c "import hy3dgen; print('hy3dgen (multi-view shape): OK')" || echo '!! MISSING: hy3dgen (multi-view falls back to single view)' >> /tmp/pipskip.log; \
     exit 0
+
+# re-assert the critical pins in case ANY later step floated them (loud)
+RUN pip install --no-cache-dir "transformers==4.46.0" "huggingface-hub==0.30.2" "safetensors==0.4.4" && \
+    pip install --no-cache-dir "numpy==1.26.4"
 
 # quality defaults: 768px paint views (up from 512) — finer texture before the
 # 4x super-resolution pass. KQ_FORGE_PAINT_VIEWS stays 6 (official-safe); try 8
@@ -162,6 +168,11 @@ RUN set +e; \
 ENV KQ_FORGE_PAINT_RES=768
 
 COPY handler.py /app/handler.py
+
+# --- THE GATE, LAST: validates the FINAL environment (after every install that
+# could have floated a version). If this passes, what ships is what was tested.
+COPY enginecheck.py /app/enginecheck.py
+RUN python /app/enginecheck.py
 
 # RunPod serverless invokes the handler; it never listens on a port.
 CMD ["python", "-u", "handler.py"]
