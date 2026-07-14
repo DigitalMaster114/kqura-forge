@@ -164,22 +164,48 @@ def _strip_base_plate(mesh):
     return mesh
 
 
+def _decimate_for_paint(mesh_path):
+    """Shrink the raw sculpt (300-600k tris) to a clean paint-ready mesh using
+    pymeshlab (installed + green in the gate) — replaces the painter's own
+    remesh prep, which needs the perpetually-uninstallable open3d. THIS is the
+    wavy/melted-texture fix: painting a decimated mesh gives crisp bakes."""
+    target = int(os.environ.get("KQ_FORGE_PAINT_FACES", "40000"))
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.load_new_mesh(mesh_path)
+        n = ms.current_mesh().face_number()
+        if n <= target * 1.3:
+            return mesh_path
+        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target, preservenormal=True)
+        out = mesh_path + ".dec.obj"
+        ms.save_current_mesh(out)
+        print("decimated for paint: %d -> ~%d faces" % (n, target))
+        return out
+    except Exception as e:
+        print("decimation skipped (%s) — painting the raw mesh" % str(e)[:150])
+        return mesh_path
+
+
 def _paint_mesh(mesh_path, ref_pil, out_path):
     """Run the 2.1 PBR painter (file-path API) and guarantee a GLB comes out.
-    If the remesh prep dies (usually missing open3d for trimesh's simplifier),
-    retry once without remesh rather than failing the whole job."""
+    We pre-decimate ourselves (pymeshlab), so the painter's own remesh prep
+    (which needs open3d) is skipped when our decimation succeeded."""
     ref_path = out_path + ".ref.png"
     ref_pil.save(ref_path)
+    paint_input = _decimate_for_paint(mesh_path)
+    pre_decimated = paint_input != mesh_path
     pipe = _paint_pipe()
     try:
-        res = pipe(mesh_path=mesh_path, image_path=ref_path, output_mesh_path=out_path)
+        res = pipe(mesh_path=paint_input, image_path=ref_path, output_mesh_path=out_path,
+                   use_remesh=not pre_decimated)
     except TypeError:
-        res = pipe(mesh_path, ref_path, out_path)   # older positional signature
+        res = pipe(paint_input, ref_path, out_path)   # older positional signature
     except Exception as e:
         msg = str(e)
         if "open3d" in msg or "simplify" in msg or "remesh" in msg or "decimation" in msg:
             print("remesh prep failed (%s) -> retrying with use_remesh=False" % msg[:120])
-            res = pipe(mesh_path=mesh_path, image_path=ref_path, output_mesh_path=out_path, use_remesh=False)
+            res = pipe(mesh_path=paint_input, image_path=ref_path, output_mesh_path=out_path, use_remesh=False)
         else:
             raise
     p = res if isinstance(res, str) and os.path.isfile(res) else out_path
