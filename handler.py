@@ -48,6 +48,15 @@ BACKEND = os.environ.get("KQ_FORGE_BACKEND", "auto")          # auto | mock | hy
 MODEL_ID = os.environ.get("KQ_FORGE_MODEL", "tencent/Hunyuan3D-2.1")
 PAINT_VIEWS = int(os.environ.get("KQ_FORGE_PAINT_VIEWS", "6"))
 PAINT_RES = int(os.environ.get("KQ_FORGE_PAINT_RES", "512"))
+# final baked UV texture resolution — THE crispness ceiling of the exported model.
+# Hunyuan defaults this to ~1024; 2048 is sharp + game-ready, 4096 heavier but max.
+TEX_SIZE = int(os.environ.get("KQ_FORGE_TEX_SIZE", "2048"))
+# auto-enhance uploaded reference images so low-quality phone shots still sculpt &
+# paint crisp. Upscales small inputs (RealESRGAN when available, else Lanczos) and
+# resamples into the [MIN, MAX] band, then a light unsharp. On by default.
+ENHANCE = os.environ.get("KQ_FORGE_ENHANCE", "1") != "0"
+ENHANCE_MIN = int(os.environ.get("KQ_FORGE_ENHANCE_MIN", "1024"))
+ENHANCE_MAX = int(os.environ.get("KQ_FORGE_ENHANCE_MAX", "2048"))
 OUT_DIR = os.environ.get("KQ_FORGE_OUT", "/tmp/kqura_forge_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -98,6 +107,15 @@ def _paint_pipe():
 
         def _mk(views, res):
             conf = Hunyuan3DPaintConfig(views, res)
+            # raise the FINAL baked texture map size (separate from per-view render
+            # res) — this is what makes the exported albedo crisp/HD. Set whichever
+            # attribute this build of the config exposes; guarded so it never breaks.
+            for _attr in ("texture_size", "tex_resolution", "texture_resolution"):
+                if hasattr(conf, _attr):
+                    try:
+                        setattr(conf, _attr, TEX_SIZE)
+                    except Exception:
+                        pass
             conf.realesrgan_ckpt_path = os.path.join(REPO, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth")
             conf.multiview_cfg_path = os.path.join(REPO, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml")
             conf.custom_pipeline = os.path.join(REPO, "hy3dpaint", "hunyuanpaintpbr")
@@ -119,6 +137,57 @@ def _decode_image(data_url):
     bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
     bg.alpha_composite(img)
     return bg.convert("RGB")
+
+
+_rrdb = {}
+
+
+def _realesrgan_upscale(img):
+    """4x AI super-resolution using the RealESRGAN ckpt already in the image.
+    Best-effort — raises if the realesrgan/basicsr stack isn't importable, and the
+    caller falls back to Lanczos."""
+    import numpy as np
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    if "up" not in _rrdb:
+        ckpt = os.path.join(REPO, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth")
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        _rrdb["up"] = RealESRGANer(scale=4, model_path=ckpt, model=model, tile=512,
+                                   tile_pad=10, pre_pad=0, half=True)
+    arr = np.array(img.convert("RGB"))[:, :, ::-1]   # RGB -> BGR
+    out, _ = _rrdb["up"].enhance(arr, outscale=4)
+    from PIL import Image
+    return Image.fromarray(out[:, :, ::-1])          # BGR -> RGB
+
+
+def _enhance_input_image(img):
+    """Clean + upscale a user reference so even a blurry, low-res upload becomes a
+    crisp reference the sculptor/painter can reproduce faithfully. Never fatal."""
+    if img is None or not ENHANCE:
+        return img
+    try:
+        from PIL import Image, ImageFilter
+        w, h = img.size
+        short = min(w, h)
+        if short < ENHANCE_MIN:
+            try:
+                img = _realesrgan_upscale(img)
+            except Exception as e:
+                print("input RealESRGAN unavailable, using Lanczos:", str(e)[:100])
+        # resample into the target band (preserve aspect), then a light crispen
+        w, h = img.size
+        short = min(w, h)
+        if short > ENHANCE_MAX:
+            s = ENHANCE_MAX / float(short)
+            img = img.resize((max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS)
+        elif short < ENHANCE_MIN:
+            s = ENHANCE_MIN / float(short)
+            img = img.resize((max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS)
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=60, threshold=2))
+        return img
+    except Exception as e:
+        print("input enhance skipped:", str(e)[:120])
+        return img
 
 
 def _strip_base_plate(mesh):
@@ -405,6 +474,21 @@ def _run_autorig(out_path, mesh_glb, joints):
     except Exception:
         pass
 
+    # BAKE the glTF-importer's Y-up->Z-up rotation into the mesh's vertices so no
+    # residual object rotation survives. Blender's importer stands a Y-up model up
+    # by putting a +90deg X rotation on the mesh OBJECT (not the verts); if we leave
+    # it, the exporter writes that +90deg back into the model node and the Y-up
+    # studio renders the rigged model lying on its back / upside-down. Applying the
+    # transform makes the object matrix identity with standing Z-up verts, so the
+    # single export conversion lands it upright.
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh.select_set(True)
+    bpy.context.view_layer.objects.active = mesh
+    try:
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    except Exception as e:
+        print("transform_apply skipped:", e)
+
     # three.js is Y-up; Blender is Z-up (the glTF importer converts the mesh the
     # same way): (x, y, z) -> (x, -z, y)
     conv = lambda p: Vector((float(p[0]), -float(p[2]), float(p[1])))
@@ -494,12 +578,12 @@ def handler(event):
         for k in ("front", "back", "left", "right"):
             im = _decode_image(raw_views.get(k) or "")
             if im is not None:
-                views[k] = im
+                views[k] = _enhance_input_image(im)
     if "front" not in views:
         im = _decode_image(inp.get("image") or "")
         if im is not None:
-            views["front"] = im
-    tex = _decode_image(inp.get("texture_image") or "")
+            views["front"] = _enhance_input_image(im)
+    tex = _enhance_input_image(_decode_image(inp.get("texture_image") or ""))
 
     mesh_glb = None
     mg = inp.get("mesh_glb") or ""
