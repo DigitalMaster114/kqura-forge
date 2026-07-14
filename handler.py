@@ -298,6 +298,16 @@ def _run_hy21(out_path, op, prompt, views, tex, skip_paint=False):
     mesh = _strip_base_plate(mesh)
 
     if skip_paint:
+        # gray master: ship with a proper clay PBR material (raw sculpts carry
+        # dark/absent visuals -> the black-silhouette bug) and real normals
+        try:
+            from trimesh.visual import TextureVisuals
+            from trimesh.visual.material import PBRMaterial
+            mesh.visual = TextureVisuals(material=PBRMaterial(
+                baseColorFactor=[0.72, 0.75, 0.80, 1.0], metallicFactor=0.0, roughnessFactor=0.9))
+            _ = mesh.vertex_normals   # force normals into the export
+        except Exception as e:
+            print("clay material skipped:", e)
         mesh.export(out_path)
         return
 
