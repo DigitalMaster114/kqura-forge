@@ -115,32 +115,50 @@ def _decode_image(data_url):
 
 
 def _strip_base_plate(mesh):
-    """Image-to-3D models sometimes hallucinate a thin display plate under the
-    feet. Remove disconnected bottom components that are wide + flat, keeping
-    everything else. Conservative: never removes a big chunk of the model."""
+    """Image-to-3D models hallucinate display plates under the feet.
+    Pass 1 removes DISCONNECTED plates (flat + wide + at the bottom + small).
+    Pass 2 handles plates FUSED to the feet: if the bottom slice of the mesh
+    spans most of the footprint in BOTH axes (feet never do — they're wide but
+    shallow), slice the mesh just above the plate and drop it back to the
+    ground. Conservative: keeps the model if anything looks off."""
     try:
         import trimesh
-        parts = mesh.split(only_watertight=False)
-        if len(parts) <= 1:
-            return mesh
         b = mesh.bounds
         h = float(b[1][1] - b[0][1]) or 1.0
-        w = float(max(b[1][0] - b[0][0], b[1][2] - b[0][2])) or 1.0
-        total_faces = sum(int(p.faces.shape[0]) for p in parts)
-        keep, removed = [], 0
-        for p in parts:
-            pb = p.bounds
-            flat = (pb[1][1] - pb[0][1]) < 0.06 * h            # very thin vertically
-            wide = max(pb[1][0] - pb[0][0], pb[1][2] - pb[0][2]) > 0.45 * w
-            at_bottom = pb[0][1] <= b[0][1] + 0.03 * h
-            small = p.faces.shape[0] < 0.30 * total_faces      # never nuke the body
-            if flat and wide and at_bottom and small:
-                removed += 1
-                continue
-            keep.append(p)
-        if removed and keep:
-            print("base plate stripped (%d component(s) removed)" % removed)
-            return trimesh.util.concatenate(keep)
+        w = float(b[1][0] - b[0][0]) or 1.0
+        d = float(b[1][2] - b[0][2]) or 1.0
+        # pass 1: disconnected plate components
+        parts = mesh.split(only_watertight=False)
+        if len(parts) > 1:
+            total_faces = sum(int(p.faces.shape[0]) for p in parts)
+            keep, removed = [], 0
+            for p in parts:
+                pb = p.bounds
+                flat = (pb[1][1] - pb[0][1]) < 0.06 * h
+                wide = max(pb[1][0] - pb[0][0], pb[1][2] - pb[0][2]) > 0.45 * max(w, d)
+                at_bottom = pb[0][1] <= b[0][1] + 0.03 * h
+                small = p.faces.shape[0] < 0.30 * total_faces
+                if flat and wide and at_bottom and small:
+                    removed += 1
+                    continue
+                keep.append(p)
+            if removed and keep:
+                mesh = trimesh.util.concatenate(keep)
+                b = mesh.bounds
+                print("base plate stripped (%d disconnected component(s))" % removed)
+        # pass 2: fused plate — bottom slice covers most of the footprint both ways
+        v = mesh.vertices
+        slab = v[v[:, 1] < b[0][1] + 0.04 * h]
+        if len(slab) > 50:
+            sw = float(slab[:, 0].max() - slab[:, 0].min())
+            sd = float(slab[:, 2].max() - slab[:, 2].min())
+            if sw > 0.55 * w and sd > 0.55 * d:
+                cut_y = float(b[0][1] + 0.045 * h)
+                cut = mesh.slice_plane([0, cut_y, 0], [0, 1, 0], cap=False)
+                if cut is not None and len(cut.faces) > 0.5 * len(mesh.faces):
+                    cut.apply_translation([0, b[0][1] - cut.bounds[0][1], 0])
+                    print("fused base plate sliced off at y=%.3f" % cut_y)
+                    return cut
     except Exception as e:
         print("plate strip skipped:", e)
     return mesh
