@@ -478,16 +478,20 @@ def _run_autorig(out_path, mesh_glb, joints):
     # residual object rotation survives. Blender's importer stands a Y-up model up
     # by putting a +90deg X rotation on the mesh OBJECT (not the verts); if we leave
     # it, the exporter writes that +90deg back into the model node and the Y-up
-    # studio renders the rigged model lying on its back / upside-down. Applying the
-    # transform makes the object matrix identity with standing Z-up verts, so the
-    # single export conversion lands it upright.
-    bpy.ops.object.select_all(action="DESELECT")
-    mesh.select_set(True)
-    bpy.context.view_layer.objects.active = mesh
+    # studio renders the rigged model lying on its back / upside-down.
+    # Done at the DATA level (mesh.data.transform) — NOT bpy.ops.transform_apply —
+    # because operators are context-fragile in headless bpy: a failed operator poll
+    # can leave the context inconsistent and break the bone-heat solve that follows
+    # (which is what stopped the rig from ever returning). Data-level bakes can't
+    # fail that way.
     try:
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        from mathutils import Matrix
+        mw = mesh.matrix_world.copy()
+        mesh.data.transform(mw)
+        mesh.matrix_world = Matrix.Identity(4)
+        mesh.data.update()
     except Exception as e:
-        print("transform_apply skipped:", e)
+        print("mesh transform bake skipped:", str(e)[:160])
 
     # three.js is Y-up; Blender is Z-up (the glTF importer converts the mesh the
     # same way): (x, y, z) -> (x, -z, y)
@@ -523,7 +527,30 @@ def _run_autorig(out_path, mesh_glb, joints):
     mesh.select_set(True)
     armobj.select_set(True)
     bpy.context.view_layer.objects.active = armobj
-    bpy.ops.object.parent_set(type="ARMATURE_AUTO")   # <- the bone-heat solve
+    # bone-heat solve. If it ever fails (a joint sitting outside the mesh volume),
+    # fall back to envelope weights + an explicit Armature modifier so the model
+    # still comes back rigged rather than the job dying with no skeleton.
+    try:
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+    except Exception as e:
+        print("ARMATURE_AUTO (bone-heat) failed, falling back to envelope:", str(e)[:200])
+        try:
+            bpy.ops.object.parent_set(type="ARMATURE_ENVELOPE")
+        except Exception as e2:
+            print("envelope parent failed too, forcing plain armature modifier:", str(e2)[:200])
+            mesh.parent = armobj
+            has_mod = any(md.type == "ARMATURE" for md in mesh.modifiers)
+            if not has_mod:
+                md = mesh.modifiers.new(name="Armature", type="ARMATURE")
+                md.object = armobj
+
+    # verify a skin actually got built before we ship — an empty export is what
+    # shows up in the studio as "no skeleton, run auto-rig"
+    n_groups = len(mesh.vertex_groups)
+    print("autorig: %d bones, %d vertex groups on mesh" % (len(joints), n_groups))
+    if n_groups == 0:
+        raise RuntimeError("rig produced no skin weights (0 vertex groups) — joints likely misaligned with the mesh")
+
     bpy.ops.export_scene.gltf(filepath=out_path, export_format="GLB")
     try:
         os.remove(raw)
