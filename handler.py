@@ -95,11 +95,18 @@ def _shape_pipe():
 def _paint_pipe():
     if "paint" not in _pipes:
         from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-        conf = Hunyuan3DPaintConfig(PAINT_VIEWS, PAINT_RES)
-        conf.realesrgan_ckpt_path = os.path.join(REPO, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth")
-        conf.multiview_cfg_path = os.path.join(REPO, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml")
-        conf.custom_pipeline = os.path.join(REPO, "hy3dpaint", "hunyuanpaintpbr")
-        _pipes["paint"] = Hunyuan3DPaintPipeline(conf)
+
+        def _mk(views, res):
+            conf = Hunyuan3DPaintConfig(views, res)
+            conf.realesrgan_ckpt_path = os.path.join(REPO, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth")
+            conf.multiview_cfg_path = os.path.join(REPO, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml")
+            conf.custom_pipeline = os.path.join(REPO, "hy3dpaint", "hunyuanpaintpbr")
+            return Hunyuan3DPaintPipeline(conf)
+        try:
+            _pipes["paint"] = _mk(PAINT_VIEWS, PAINT_RES)
+        except Exception as e:
+            print("paint config (%d views, %d res) rejected (%s) -> falling back to 6/%d" % (PAINT_VIEWS, PAINT_RES, str(e)[:120], PAINT_RES))
+            _pipes["paint"] = _mk(6, PAINT_RES)
     return _pipes["paint"]
 
 
@@ -339,6 +346,72 @@ def _run_retex21(out_path, mesh_glb, tex_img, front_img):
             pass
 
 
+def _run_autorig(out_path, mesh_glb, joints):
+    """PRO RIG: Blender's bone-heat automatic weights — the same class of
+    volumetric weighting Mixamo/Meshy-grade rigs use (heat can't jump across
+    air, so a hand never grabs the opposite leg). The studio sends the joint
+    positions the user placed/adjusted; Blender builds the armature and solves
+    the weights; we ship back a skinned GLB."""
+    import bpy
+    from mathutils import Vector
+    raw = out_path + ".in.glb"
+    with open(raw, "wb") as f:
+        f.write(mesh_glb)
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.import_scene.gltf(filepath=raw)
+    meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+    if not meshes:
+        raise RuntimeError("no meshes found in the model")
+    bpy.ops.object.select_all(action="DESELECT")
+    for m in meshes:
+        m.select_set(True)
+    bpy.context.view_layer.objects.active = meshes[0]
+    if len(meshes) > 1:
+        bpy.ops.object.join()
+    mesh = bpy.context.view_layer.objects.active
+
+    # three.js is Y-up; Blender is Z-up (the glTF importer converts the mesh the
+    # same way): (x, y, z) -> (x, -z, y)
+    conv = lambda p: Vector((float(p[0]), -float(p[2]), float(p[1])))
+    arm = bpy.data.armatures.new("KQRig")
+    armobj = bpy.data.objects.new("KQRig", arm)
+    bpy.context.collection.objects.link(armobj)
+    bpy.context.view_layer.objects.active = armobj
+    bpy.ops.object.mode_set(mode="EDIT")
+    eb = {}
+    by_name = {j["name"]: j for j in joints}
+    kids = {}
+    for j in joints:
+        kids.setdefault(j.get("parent") or "", []).append(j)
+    for j in joints:
+        b = arm.edit_bones.new(j["name"])
+        b.head = conv(j["head"])
+        ch = kids.get(j["name"]) or []
+        if ch:
+            b.tail = conv(ch[0]["head"])
+        else:
+            b.tail = b.head + Vector((0, 0, 0.06))
+        if (b.tail - b.head).length < 1e-4:
+            b.tail = b.head + Vector((0, 0, 0.06))
+        eb[j["name"]] = b
+    for j in joints:
+        p = j.get("parent")
+        if p and p in eb:
+            eb[j["name"]].parent = eb[p]
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh.select_set(True)
+    armobj.select_set(True)
+    bpy.context.view_layer.objects.active = armobj
+    bpy.ops.object.parent_set(type="ARMATURE_AUTO")   # <- the bone-heat solve
+    bpy.ops.export_scene.gltf(filepath=out_path, export_format="GLB")
+    try:
+        os.remove(raw)
+    except OSError:
+        pass
+
+
 def _ingest(ingest_url, key, token, glb_path):
     import urllib.request
     with open(glb_path, "rb") as f:
@@ -419,11 +492,15 @@ def handler(event):
         return {"error": "image3d needs at least a front image"}
     if op == "retex" and (mesh_glb is None or (tex is None and "front" not in views)):
         return {"error": "retex needs mesh_glb and a reference image"}
+    if op == "autorig" and (mesh_glb is None or not inp.get("joints")):
+        return {"error": "autorig needs the model mesh and the joint list"}
 
     out_path = os.path.join(OUT_DIR, uuid.uuid4().hex[:20] + ".glb")
     t0 = time.time()
     try:
-        if op == "retex":
+        if op == "autorig":
+            _run_autorig(out_path, mesh_glb, inp.get("joints") or [])
+        elif op == "retex":
             front = views.get("front")
             if _backend() == "hy21":
                 _run_retex21(out_path, mesh_glb, tex, front)

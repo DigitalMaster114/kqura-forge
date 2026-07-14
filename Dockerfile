@@ -162,10 +162,19 @@ RUN set +e; \
 RUN pip install --no-cache-dir "transformers==4.46.0" "huggingface-hub==0.30.2" "safetensors==0.4.4" && \
     pip install --no-cache-dir "numpy==1.26.4"
 
-# quality defaults: 768px paint views (up from 512) — finer texture before the
-# 4x super-resolution pass. KQ_FORGE_PAINT_VIEWS stays 6 (official-safe); try 8
-# via the endpoint env once 768 proves out.
-ENV KQ_FORGE_PAINT_RES=768
+# MAXIMUM-QUALITY defaults (Brian: trade speed for quality, always):
+#   PAINT_RES 768        — finer paint views before the 4x super-resolution
+#   PAINT_VIEWS 8        — more angles = fewer seams (handler falls back to 6
+#                          automatically if the painter rejects 8)
+#   PAINT_FACES 60000    — richer paint-ready mesh (was 40k)
+#   OCTREE 448           — finer sculpt voxel grid (faces, hands, details)
+#   SHAPE_STEPS 60       — more diffusion steps for the sculpt
+# All overridable per-endpoint via RunPod env vars without a rebuild.
+ENV KQ_FORGE_PAINT_RES=768 \
+    KQ_FORGE_PAINT_VIEWS=8 \
+    KQ_FORGE_PAINT_FACES=60000 \
+    KQ_FORGE_OCTREE=448 \
+    KQ_FORGE_SHAPE_STEPS=60
 
 COPY handler.py /app/handler.py
 
