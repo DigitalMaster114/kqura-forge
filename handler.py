@@ -212,25 +212,64 @@ def _run_mock_retex(out_path, mesh_glb):
         _run_mock(out_path, "retex", "", {}, None)
 
 
-def _run_hy21(out_path, op, prompt, views, tex):
-    """Hunyuan3D-2.1: front image -> shape -> PBR texture (+4x SR) -> GLB.
-    (2.1 has no multiview shape model yet; extra views are accepted but only
-    the front drives the sculpt — the texture ref drives the colors.)"""
+def _shape_pipe_mv():
+    """TRUE MULTI-VIEW shape model (Hunyuan3D-2mv, from the 2.0 family): takes
+    {front/back/left/right} images so the back/side references actually drive
+    the hidden geometry (no more invented tails). The original integration
+    failed because this model lives in its OWN repo folder that was never
+    specified — from_pretrained needs subfolder='hunyuan3d-dit-v2-mv'."""
+    if "shape_mv" not in _pipes:
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline as MVPipeline
+        _pipes["shape_mv"] = _load_pretrained(MVPipeline, "tencent/Hunyuan3D-2mv", subfolder="hunyuan3d-dit-v2-mv")
+    return _pipes["shape_mv"]
+
+
+def _run_hy21(out_path, op, prompt, views, tex, skip_paint=False):
+    """front(+back/side) images -> shape -> [PBR texture (+4x SR)] -> GLB.
+    Multi-view (>=2 views) uses the dedicated 2mv shape model so hidden parts
+    follow YOUR references; single view uses the 2.1 shape model. With
+    skip_paint the gray master ships as-is (two-step Meshy-style flow)."""
     if not views or "front" not in views:
         raise RuntimeError("This engine sculpts from an image; give it at least a front view.")
     from hy3dshape.rembg import BackgroundRemover
     rem = BackgroundRemover()
-    front = views["front"]
-    try:
-        front = rem(front)
-    except Exception:
-        pass
+    clean = {}
+    for k, im in views.items():
+        try:
+            clean[k] = rem(im)
+        except Exception:
+            clean[k] = im
+    front = clean["front"]
 
-    mesh = _shape_pipe()(image=front)[0]
+    # max-fidelity knobs (env-tunable, safe fallback if a pipeline rejects them)
+    _steps = int(os.environ.get("KQ_FORGE_SHAPE_STEPS", "50"))
+    _octree = int(os.environ.get("KQ_FORGE_OCTREE", "384"))
+
+    def _sculpt(pipe, image):
+        try:
+            return pipe(image=image, num_inference_steps=_steps, octree_resolution=_octree)[0]
+        except TypeError:
+            return pipe(image=image)[0]
+
+    mesh = None
+    if len(clean) >= 2:
+        try:
+            mesh = _sculpt(_shape_pipe_mv(), clean)
+            print("multi-view sculpt used (%d views)" % len(clean))
+        except Exception:
+            import traceback
+            print("multi-view sculpt failed, falling back to single view:", traceback.format_exc()[-600:])
+            mesh = None
+    if mesh is None:
+        mesh = _sculpt(_shape_pipe(), front)
     mesh = _strip_base_plate(mesh)
+
+    if skip_paint:
+        mesh.export(out_path)
+        return
+
     raw_path = out_path + ".raw.glb"
     mesh.export(raw_path)
-
     ref = tex if tex is not None else views["front"]
     if tex is not None:
         try:
@@ -365,7 +404,7 @@ def handler(event):
             else:
                 _run_mock_retex(out_path, mesh_glb)
         elif _backend() == "hy21":
-            _run_hy21(out_path, op, prompt, views, tex)
+            _run_hy21(out_path, op, prompt, views, tex, skip_paint=bool(inp.get("skip_paint")))
         else:
             _run_mock(out_path, op, prompt, views, tex)
     except Exception as e:

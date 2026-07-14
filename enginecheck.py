@@ -46,6 +46,11 @@ check("realesrgan", lambda: __import__("realesrgan"), diag)
 check("rembg", lambda: __import__("rembg"), diag)
 check("custom_rasterizer (compiled)", lambda: __import__("custom_rasterizer"), diag)
 check("bpy (Blender — GLB packer)", lambda: __import__("bpy"), diag)
+# the paint RUNTIME chain (caught us once: matplotlib demanded numpy>=1.25)
+check("pytorch_lightning (paint runtime)", lambda: __import__("pytorch_lightning"), diag)
+check("hy3dgen (multi-view shape, optional)", lambda: __import__("hy3dgen"), diag)
+check("torchmetrics (paint runtime)", lambda: __import__("torchmetrics"), diag)
+check("matplotlib (torchmetrics needs it)", lambda: __import__("matplotlib"), diag)
 
 try:
     from torchvision_fix import apply_fix

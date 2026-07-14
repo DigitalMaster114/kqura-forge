@@ -143,6 +143,24 @@ RUN mkdir -p /app/Hunyuan3D-2.1/hy3dpaint/ckpt && \
       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth && \
     python -c "import os; s=os.path.getsize('/app/Hunyuan3D-2.1/hy3dpaint/ckpt/RealESRGAN_x4plus.pth'); assert s > 50_000_000, 'ckpt too small: %d' % s; print('RealESRGAN ckpt OK:', s, 'bytes')"
 
+# --- Hunyuan3D-2.0 family (hy3dgen) — ONLY for the true MULTI-VIEW shape model
+# (tencent/Hunyuan3D-2mv, subfolder hunyuan3d-dit-v2-mv): back/side references
+# actually drive hidden geometry. Module names don't collide with 2.1
+# (hy3dgen vs hy3dshape/hy3dpaint). Tolerant: if this fails, the engine still
+# ships with single-view sculpt + the gate's diagnostic names it.
+RUN set +e; \
+    git clone --depth 1 https://github.com/Tencent/Hunyuan3D-2 /app/Hunyuan3D-2 && \
+    cd /app/Hunyuan3D-2 && \
+    sed -i '/^torch\b/d; /^torch=/d; /^torch>/d; /^torchvision/d; /^torchaudio/d' requirements.txt && \
+    pip install --no-cache-dir -e . ; \
+    python -c "import hy3dgen; print('hy3dgen (multi-view shape): OK')" || echo '!! MISSING: hy3dgen (multi-view falls back to single view)' >> /tmp/pipskip.log; \
+    exit 0
+
+# quality defaults: 768px paint views (up from 512) — finer texture before the
+# 4x super-resolution pass. KQ_FORGE_PAINT_VIEWS stays 6 (official-safe); try 8
+# via the endpoint env once 768 proves out.
+ENV KQ_FORGE_PAINT_RES=768
+
 COPY handler.py /app/handler.py
 
 # RunPod serverless invokes the handler; it never listens on a port.
