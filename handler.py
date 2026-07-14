@@ -57,6 +57,12 @@ TEX_SIZE = int(os.environ.get("KQ_FORGE_TEX_SIZE", "2048"))
 ENHANCE = os.environ.get("KQ_FORGE_ENHANCE", "1") != "0"
 ENHANCE_MIN = int(os.environ.get("KQ_FORGE_ENHANCE_MIN", "1024"))
 ENHANCE_MAX = int(os.environ.get("KQ_FORGE_ENHANCE_MAX", "2048"))
+# mesh finishing — denoise the raw marching-cubes surface (kills the 'wavy'/stairstep
+# look for a cleaner, more Meshy-like result) and optionally rebuild to even topology.
+SMOOTH = os.environ.get("KQ_FORGE_SMOOTH", "1") != "0"          # volume-preserving Taubin, safe/on
+SMOOTH_ITERS = int(os.environ.get("KQ_FORGE_SMOOTH_ITERS", "3"))
+REMESH = os.environ.get("KQ_FORGE_REMESH", "0") != "0"          # isotropic retopo, heavier/opt-in
+REMESH_PCT = float(os.environ.get("KQ_FORGE_REMESH_PCT", "0.6"))  # target edge = % of bbox diagonal
 OUT_DIR = os.environ.get("KQ_FORGE_OUT", "/tmp/kqura_forge_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -240,6 +246,59 @@ def _strip_base_plate(mesh):
     return mesh
 
 
+def _cleanup_mesh(mesh):
+    """Finish the raw marching-cubes sculpt so it reads clean like a Meshy mesh: a
+    volume-preserving Taubin low-pass removes the 'wavy'/stairstep surface noise
+    without collapsing the silhouette; an optional isotropic remesh rebuilds even
+    topology. Every step is guarded — any failure returns the mesh unchanged so the
+    sculpt→paint→rig pipeline can never be broken by finishing."""
+    # 1) denoise (default on) — trimesh Taubin, stable API, in-memory
+    if SMOOTH:
+        try:
+            import trimesh.smoothing as _sm
+            _sm.filter_taubin(mesh, lamb=0.5, nu=0.53, iterations=max(1, SMOOTH_ITERS))
+            try:
+                _ = mesh.vertex_normals
+            except Exception:
+                pass
+            print("mesh finish: taubin denoise x%d (%d verts)" % (SMOOTH_ITERS, len(mesh.vertices)))
+        except Exception as e:
+            print("taubin denoise skipped:", str(e)[:140])
+    # 2) even-topology remesh (opt-in) — pymeshlab, file round-trip like _decimate_for_paint
+    if REMESH:
+        tmp_in = os.path.join(OUT_DIR, uuid.uuid4().hex[:12] + ".rm_in.obj")
+        try:
+            mesh.export(tmp_in)
+            import pymeshlab
+            import trimesh
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(tmp_in)
+            try:
+                pct = pymeshlab.PercentageValue(REMESH_PCT)
+            except Exception:
+                pct = pymeshlab.Percentage(REMESH_PCT)   # older pymeshlab name
+            ms.meshing_isotropic_explicit_remeshing(iterations=3, targetlen=pct)
+            tmp_out = tmp_in + ".rm.obj"
+            ms.save_current_mesh(tmp_out)
+            rm = trimesh.load(tmp_out, process=False, force="mesh")
+            if rm is not None and len(rm.faces) > 100:
+                _ = rm.vertex_normals
+                print("mesh finish: isotropic remesh -> %d faces" % len(rm.faces))
+                mesh = rm
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+        except Exception as e:
+            print("remesh skipped:", str(e)[:140])
+        finally:
+            try:
+                os.remove(tmp_in)
+            except OSError:
+                pass
+    return mesh
+
+
 def _decimate_for_paint(mesh_path):
     """Shrink the raw sculpt (300-600k tris) to a clean paint-ready mesh using
     pymeshlab (installed + green in the gate) — replaces the painter's own
@@ -365,6 +424,7 @@ def _run_hy21(out_path, op, prompt, views, tex, skip_paint=False):
     if mesh is None:
         mesh = _sculpt(_shape_pipe(), front)
     mesh = _strip_base_plate(mesh)
+    mesh = _cleanup_mesh(mesh)   # denoise the raw surface (kills 'wavy' look) — Meshy-clean finish
 
     if skip_paint:
         # gray master: ship with a proper clay PBR material (raw sculpts carry
@@ -547,11 +607,40 @@ def _run_autorig(out_path, mesh_glb, joints):
     # verify a skin actually got built before we ship — an empty export is what
     # shows up in the studio as "no skeleton, run auto-rig"
     n_groups = len(mesh.vertex_groups)
-    print("autorig: %d bones, %d vertex groups on mesh" % (len(joints), n_groups))
     if n_groups == 0:
         raise RuntimeError("rig produced no skin weights (0 vertex groups) — joints likely misaligned with the mesh")
 
-    bpy.ops.export_scene.gltf(filepath=out_path, export_format="GLB")
+    # Guarantee the mesh keeps a live Armature modifier bound to our armature. The
+    # glTF exporter only writes a skin (bones) for a mesh with an ACTIVE armature
+    # modifier; if it's missing, or if export APPLIES modifiers, the armature has
+    # no user and gets dropped -> the model comes back with ZERO bones despite the
+    # weights existing (the exact "server skin export dropped" symptom).
+    mod_ok = any(md.type == "ARMATURE" and md.object == armobj for md in mesh.modifiers)
+    if not mod_ok:
+        md = mesh.modifiers.new(name="Armature", type="ARMATURE")
+        md.object = armobj
+        mod_ok = True
+    print("autorig: %d joints, %d vertex groups, armature_modifier=%s" % (len(joints), n_groups, mod_ok))
+
+    # Export with skins ON and modifier-apply OFF, explicitly. Fall back through
+    # simpler arg sets if this Blender build doesn't accept a given kwarg, so the
+    # export can't silently bake the rig away.
+    export_ok = False
+    for _kw in (
+        dict(export_skins=True, export_apply=False, use_selection=False),
+        dict(export_skins=True, export_apply=False),
+        dict(export_skins=True),
+        dict(),
+    ):
+        try:
+            bpy.ops.export_scene.gltf(filepath=out_path, export_format="GLB", **_kw)
+            export_ok = True
+            print("autorig export ok, args:", sorted(_kw.keys()))
+            break
+        except TypeError as _te:
+            print("export kwargs rejected (%s), trying simpler set" % str(_te)[:100])
+    if not export_ok:
+        raise RuntimeError("glTF export failed for every argument set")
     try:
         os.remove(raw)
     except OSError:

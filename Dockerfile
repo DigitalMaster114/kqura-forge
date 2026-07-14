@@ -163,18 +163,26 @@ RUN pip install --no-cache-dir "transformers==4.46.0" "huggingface-hub==0.30.2" 
     pip install --no-cache-dir "numpy==1.26.4"
 
 # MAXIMUM-QUALITY defaults (Brian: trade speed for quality, always):
-#   PAINT_RES 768        — finer paint views before the 4x super-resolution
+#   PAINT_RES 1024       — finer paint views before the 4x super-resolution
 #   PAINT_VIEWS 8        — more angles = fewer seams (handler falls back to 6
 #                          automatically if the painter rejects 8)
 #   PAINT_FACES 60000    — richer paint-ready mesh (was 40k)
+#   TEX_SIZE 4096        — final baked texture map (4K game-ready; 8192 = max, opt-in)
 #   OCTREE 448           — finer sculpt voxel grid (faces, hands, details)
 #   SHAPE_STEPS 60       — more diffusion steps for the sculpt
+#   SMOOTH 1             — Taubin denoise the raw sculpt (kills 'wavy' surface)
+#   ENHANCE 1            — auto-upscale/clean low-res reference uploads
 # All overridable per-endpoint via RunPod env vars without a rebuild.
-ENV KQ_FORGE_PAINT_RES=768 \
+# (OCTREE 512 / PAINT_RES up / TEX_SIZE 8192 / REMESH 1 are heavier opt-ins — set
+#  them per-endpoint on a 48GB GPU when you want to push a hero character further.)
+ENV KQ_FORGE_PAINT_RES=1024 \
     KQ_FORGE_PAINT_VIEWS=8 \
     KQ_FORGE_PAINT_FACES=60000 \
+    KQ_FORGE_TEX_SIZE=4096 \
     KQ_FORGE_OCTREE=448 \
-    KQ_FORGE_SHAPE_STEPS=60
+    KQ_FORGE_SHAPE_STEPS=60 \
+    KQ_FORGE_SMOOTH=1 \
+    KQ_FORGE_ENHANCE=1
 
 COPY handler.py /app/handler.py
 
